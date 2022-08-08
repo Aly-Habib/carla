@@ -59,7 +59,9 @@ class BasicAgent(object):
         self._sampling_resolution = 2.0
         self._base_tlight_threshold = 5.0  # meters
         self._base_vehicle_threshold = 5.0  # meters
+        self._speed_ratio = 1
         self._max_brake = 0.5
+        self._offset = 0
 
         # Change parameters according to the dictionary
         opt_dict['target_speed'] = target_speed
@@ -75,8 +77,12 @@ class BasicAgent(object):
             self._base_tlight_threshold = opt_dict['base_tlight_threshold']
         if 'base_vehicle_threshold' in opt_dict:
             self._base_vehicle_threshold = opt_dict['base_vehicle_threshold']
+        if 'detection_speed_ratio' in opt_dict:
+            self._speed_ratio = opt_dict['detection_speed_ratio']
         if 'max_brake' in opt_dict:
-            self._max_steering = opt_dict['max_brake']
+            self._max_brake = opt_dict['max_brake']
+        if 'offset' in opt_dict:
+            self._offset = opt_dict['offset']
 
         # Initialize the planners
         self._local_planner = LocalPlanner(self._vehicle, opt_dict=opt_dict, map_inst=self._map)
@@ -187,13 +193,13 @@ class BasicAgent(object):
         vehicle_speed = get_speed(self._vehicle) / 3.6
 
         # Check for possible vehicle obstacles
-        max_vehicle_distance = self._base_vehicle_threshold + vehicle_speed
+        max_vehicle_distance = self._base_vehicle_threshold + self._speed_ratio * vehicle_speed
         affected_by_vehicle, _, _ = self._vehicle_obstacle_detected(vehicle_list, max_vehicle_distance)
         if affected_by_vehicle:
             hazard_detected = True
 
         # Check if the vehicle is affected by a red traffic light
-        max_tlight_distance = self._base_tlight_threshold + vehicle_speed
+        max_tlight_distance = self._base_tlight_threshold + self._speed_ratio * vehicle_speed
         affected_by_tlight, _ = self._affected_by_traffic_light(self._lights_list, max_tlight_distance)
         if affected_by_tlight:
             hazard_detected = True
@@ -325,13 +331,11 @@ class BasicAgent(object):
             lane_offset *= -1
 
         # Get the transform of the front of the ego
-        ego_forward_vector = ego_transform.get_forward_vector()
-        ego_extent = self._vehicle.bounding_box.extent.x
         ego_front_transform = ego_transform
         ego_front_transform.location += carla.Location(
-            x=ego_extent * ego_forward_vector.x,
-            y=ego_extent * ego_forward_vector.y,
-        )
+            self._vehicle.bounding_box.extent.x * ego_transform.get_forward_vector())
+
+        opposite_invasion = abs(self._offset) + self._vehicle.bounding_box.extent.y > ego_wpt.lane_width / 2
 
         for target_vehicle in vehicle_list:
             target_transform = target_vehicle.get_transform()
@@ -340,35 +344,16 @@ class BasicAgent(object):
 
             target_wpt = self._map.get_waypoint(target_transform.location, lane_type=carla.LaneType.Any)
 
-            # Simplified version for outside junctions
-            if not ego_wpt.is_junction or not target_wpt.is_junction:
-
-                if target_wpt.road_id != ego_wpt.road_id or target_wpt.lane_id != ego_wpt.lane_id  + lane_offset:
-                    next_wpt = self._local_planner.get_incoming_waypoint_and_direction(steps=3)[0]
-                    if not next_wpt:
-                        continue
-                    if target_wpt.road_id != next_wpt.road_id or target_wpt.lane_id != next_wpt.lane_id  + lane_offset:
-                        continue
-
-                target_forward_vector = target_transform.get_forward_vector()
-                target_extent = target_vehicle.bounding_box.extent.x
-                target_rear_transform = target_transform
-                target_rear_transform.location -= carla.Location(
-                    x=target_extent * target_forward_vector.x,
-                    y=target_extent * target_forward_vector.y,
-                )
-
-                if is_within_distance(target_rear_transform, ego_front_transform, max_distance, [low_angle_th, up_angle_th]):
-                    return (True, target_vehicle, compute_distance(target_transform.location, ego_transform.location))
-
-            # Waypoints aren't reliable, check the proximity of the vehicle to the route
-            else:
+            # General approach for junctions and vehicles invading other lanes due to the offset
+            if opposite_invasion or ego_wpt.is_junction or target_wpt.is_junction:
                 route_bb = []
                 ego_location = ego_transform.location
                 extent_y = self._vehicle.bounding_box.extent.y
+                right_extent = extent_y + self._offset
+                left_extent = -extent_y + self._offset
                 r_vec = ego_transform.get_right_vector()
-                p1 = ego_location + carla.Location(extent_y * r_vec.x, extent_y * r_vec.y)
-                p2 = ego_location + carla.Location(-extent_y * r_vec.x, -extent_y * r_vec.y)
+                p1 = ego_location + carla.Location(right_extent * r_vec.x, right_extent * r_vec.y)
+                p2 = ego_location + carla.Location(left_extent * r_vec.x, left_extent * r_vec.y)
                 route_bb.append([p1.x, p1.y, p1.z])
                 route_bb.append([p2.x, p2.y, p2.z])
 
@@ -377,8 +362,8 @@ class BasicAgent(object):
                         break
 
                     r_vec = wp.transform.get_right_vector()
-                    p1 = wp.transform.location + carla.Location(extent_y * r_vec.x, extent_y * r_vec.y)
-                    p2 = wp.transform.location + carla.Location(-extent_y * r_vec.x, -extent_y * r_vec.y)
+                    p1 = wp.transform.location + carla.Location(right_extent * r_vec.x, right_extent * r_vec.y)
+                    p2 = wp.transform.location + carla.Location(left_extent * r_vec.x, left_extent * r_vec.y)
                     route_bb.append([p1.x, p1.y, p1.z])
                     route_bb.append([p2.x, p2.y, p2.z])
 
@@ -404,6 +389,28 @@ class BasicAgent(object):
                         return (True, target_vehicle, compute_distance(target_vehicle.get_location(), ego_location))
 
                 return (False, None, -1)
+
+            # Simplified approach, using only the plan waypoints (similar to TM)
+            else:
+
+                if target_wpt.road_id != ego_wpt.road_id or target_wpt.lane_id != ego_wpt.lane_id  + lane_offset:
+                    next_wpt = self._local_planner.get_incoming_waypoint_and_direction(steps=3)[0]
+                    if not next_wpt:
+                        continue
+                    if target_wpt.road_id != next_wpt.road_id or target_wpt.lane_id != next_wpt.lane_id  + lane_offset:
+                        continue
+
+                target_forward_vector = target_transform.get_forward_vector()
+                target_extent = target_vehicle.bounding_box.extent.x
+                target_rear_transform = target_transform
+                target_rear_transform.location -= carla.Location(
+                    x=target_extent * target_forward_vector.x,
+                    y=target_extent * target_forward_vector.y,
+                )
+
+                if is_within_distance(target_rear_transform, ego_front_transform, max_distance, [low_angle_th, up_angle_th]):
+                    return (True, target_vehicle, compute_distance(target_transform.location, ego_transform.location))
+
 
         return (False, None, -1)
 
